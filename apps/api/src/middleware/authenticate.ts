@@ -82,16 +82,7 @@ export async function authenticate(req: FastifyRequest, reply: FastifyReply) {
   }
 }
 
-export function requirePlan(minPlan: Plan) {
-  const hierarchy: Record<Plan, number> = { FREE: 0, PRO: 1, TEAM: 2, ENTERPRISE: 3 };
-  return async (req: FastifyRequest, reply: FastifyReply) => {
-    if (hierarchy[req.userPlan] < hierarchy[minPlan]) {
-      return reply.status(403).send({
-        error:        'upgrade_required',
-        requiredPlan: minPlan,
-        currentPlan:  req.userPlan,
-        upgradeUrl:   `${process.env.APP_BASE_URL}/pricing`,
-      });
-    }
-  };
+// All features are free — plan checks are disabled
+export function requirePlan(_minPlan: Plan) {
+  return async (_req: FastifyRequest, _reply: FastifyReply) => {};
 }

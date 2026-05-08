@@ -1,20 +1,16 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { TokenTracker } from './tokenTracker';
 import { AuthManager } from './authManager';
 import { UsageSync } from './usageSync';
-import { OnboardingPanel } from './onboardingPanel';
-import { BudgetManager } from './budgetManager';
 import { AllStats } from './types';
-import { APP_BASE, API_BASE } from './constants';
+import { calcCost } from './pricing';
 
 let tokenTracker: TokenTracker;
 let authManager: AuthManager;
 let usageSync: UsageSync;
-let budgetManager: BudgetManager;
 let statusBarItem: vscode.StatusBarItem;
-let currentPlan: 'free' | 'pro' | 'team' | 'enterprise' = 'free';
-
-const isPaid = () => currentPlan !== 'free';
+let dashboardPanel: vscode.WebviewPanel | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration('aiTokenTracker');
@@ -24,19 +20,23 @@ export async function activate(context: vscode.ExtensionContext) {
   authManager = new AuthManager(context);
   tokenTracker = new TokenTracker(claudeLogPath, model);
   usageSync = new UsageSync(authManager, tokenTracker);
-  budgetManager = new BudgetManager(authManager);
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
+  // Start tracking immediately — no sign-in required
+  tokenTracker.on('update', onStatsUpdate);
+  tokenTracker.start();
+  updateStatusBar(tokenTracker.getStats());
+
+  // Background sync if already signed in
+  authManager.isAuthenticated().then(isAuth => {
+    if (isAuth) usageSync.start();
+  });
+
   context.subscriptions.push(
-    vscode.commands.registerCommand('aiTokenTracker.showDashboard', async () => {
-      const isAuth = await authManager.isAuthenticated();
-      if (!isAuth) {
-        OnboardingPanel.show(context, authManager, onSignedIn);
-        return;
-      }
+    vscode.commands.registerCommand('aiTokenTracker.showDashboard', () => {
       showDashboardPanel(context);
     }),
 
@@ -47,9 +47,6 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiTokenTracker.signOut', async () => {
       await authManager.signOut();
       usageSync.stop();
-      tokenTracker.off('update', onStatsUpdate);
-      currentPlan = 'free';
-      setStatusBarSignedOut();
       vscode.window.showInformationMessage('AI Token Tracker: Signed out.');
     }),
 
@@ -68,46 +65,8 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
 
-    vscode.commands.registerCommand('aiTokenTracker.viewPlans', () => {
-      vscode.env.openExternal(vscode.Uri.parse(`${APP_BASE}/pricing`));
-    }),
-
-    vscode.commands.registerCommand('aiTokenTracker.setBudget', async () => {
-      if (!isPaid()) {
-        const choice = await vscode.window.showInformationMessage(
-          'Budget alerts are a Pro feature. Upgrade to set spending limits.',
-          'Upgrade to Pro'
-        );
-        if (choice) vscode.env.openExternal(vscode.Uri.parse(`${APP_BASE}/pricing`));
-        return;
-      }
-      await budgetManager.setBudget(context);
-    }),
-
-    vscode.commands.registerCommand('aiTokenTracker.compareModels', async () => {
-      if (!isPaid()) {
-        const choice = await vscode.window.showInformationMessage(
-          'Model comparison is a Pro feature. Upgrade to see cost savings.',
-          'Upgrade to Pro'
-        );
-        if (choice) vscode.env.openExternal(vscode.Uri.parse(`${APP_BASE}/pricing`));
-        return;
-      }
-      showModelComparisonPanel(context);
-    }),
-
     vscode.commands.registerCommand('aiTokenTracker.exportData', async () => {
-      if (!isPaid()) {
-        const choice = await vscode.window.showInformationMessage(
-          'CSV export is a Pro feature.',
-          'Upgrade to Pro'
-        );
-        if (choice) vscode.env.openExternal(vscode.Uri.parse(`${APP_BASE}/pricing`));
-        return;
-      }
-      const token = await authManager.getToken();
-      if (!token) return;
-      vscode.env.openExternal(vscode.Uri.parse(`${API_BASE}/usage/export`));
+      await exportCsvLocally(tokenTracker.getStats());
     })
   );
 
@@ -119,34 +78,13 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     })
   );
-
-  const isAuth = await authManager.isAuthenticated();
-  if (!isAuth) {
-    setStatusBarSignedOut();
-    OnboardingPanel.show(context, authManager, onSignedIn);
-  } else {
-    const session = await authManager.getSession();
-    if (session) { currentPlan = session.plan; }
-    startTracking();
-  }
-}
-
-function onSignedIn() {
-  authManager.getSession().then(session => {
-    if (session) { currentPlan = session.plan; }
-    startTracking();
-  });
-}
-
-function startTracking() {
-  tokenTracker.on('update', onStatsUpdate);
-  tokenTracker.start();
-  usageSync.start();
-  updateStatusBar(tokenTracker.getStats());
 }
 
 function onStatsUpdate(stats: AllStats) {
   updateStatusBar(stats);
+  if (dashboardPanel) {
+    dashboardPanel.webview.postMessage({ type: 'update', data: stats });
+  }
 }
 
 export async function deactivate() {
@@ -155,26 +93,19 @@ export async function deactivate() {
   await usageSync?.forceSync();
 }
 
-async function doSignIn(context: vscode.ExtensionContext) {
+async function doSignIn(_context: vscode.ExtensionContext) {
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: 'AI Token Tracker: Opening sign-in...' },
     async () => {
       const session = await authManager.signIn();
       if (session) {
-        currentPlan = session.plan;
-        vscode.window.showInformationMessage(`Signed in as ${session.email} — tracking started!`);
-        onSignedIn();
+        vscode.window.showInformationMessage(`Signed in as ${session.email} — syncing enabled.`);
+        usageSync.start();
       } else {
-        vscode.window.showErrorMessage('AI Token Tracker: Sign-in failed or timed out. Please try again.');
+        vscode.window.showErrorMessage('AI Token Tracker: Sign-in failed or timed out.');
       }
     }
   );
-}
-
-function setStatusBarSignedOut() {
-  statusBarItem.text = '$(lock) AI Token Tracker';
-  statusBarItem.tooltip = 'Click to sign in and start tracking your AI token usage';
-  statusBarItem.command = 'aiTokenTracker.signIn';
 }
 
 function updateStatusBar(stats: AllStats) {
@@ -182,29 +113,18 @@ function updateStatusBar(stats: AllStats) {
   if (!show) { statusBarItem.hide(); return; }
 
   const s = stats.currentSession;
-  const sessionTokens = s ? s.totalInput + s.totalOutput : 0;
-
   const modelShort = (m: string) => m.replace('claude-', '').replace('gpt-', 'gpt/');
 
-  if (isPaid() && s) {
+  if (s) {
+    const sessionTokens = s.totalInput + s.totalOutput;
     statusBarItem.text = `$(pulse) ${modelShort(s.model)} ${fmtTokens(sessionTokens)} $${s.estimatedCost.toFixed(4)}`;
     statusBarItem.tooltip = new vscode.MarkdownString(
       `**Current session**\n\nModel: \`${s.model}\`\n` +
       `Input: ${fmtTokens(s.totalInput)}  Output: ${fmtTokens(s.totalOutput)}\n` +
+      `Cache read: ${fmtTokens(s.totalCacheRead)}  Cache write: ${fmtTokens(s.totalCacheWrite)}\n` +
       `Cost: $${s.estimatedCost.toFixed(4)}  Turns: ${s.turns}\n\n` +
       `*Click to open dashboard*`
     );
-  } else if (s) {
-    statusBarItem.text = `$(pulse) ${modelShort(s.model)} ${fmtTokens(sessionTokens)}`;
-    statusBarItem.tooltip = new vscode.MarkdownString(
-      `**Current session**\n\nModel: \`${s.model}\`\n` +
-      `Input: ${fmtTokens(s.totalInput)}  Output: ${fmtTokens(s.totalOutput)}\n` +
-      `Turns: ${s.turns}\n\n` +
-      `Cost: 🔒 *Pro feature*\n\n` +
-      `[Upgrade — $9/mo](${APP_BASE}/pricing)\n\n` +
-      `*Click to open dashboard*`
-    );
-    (statusBarItem.tooltip as vscode.MarkdownString).isTrusted = true;
   } else {
     statusBarItem.text = `$(pulse) AI Token Tracker`;
     statusBarItem.tooltip = 'AI Token Tracker — no active session\nClick to open dashboard';
@@ -215,345 +135,547 @@ function updateStatusBar(stats: AllStats) {
 }
 
 function showDashboardPanel(context: vscode.ExtensionContext) {
-  const panel = vscode.window.createWebviewPanel(
-    'aiTokenTrackerDashboard',
-    'AI Token Tracker',
-    vscode.ViewColumn.Beside,
-    { enableScripts: true }
-  );
-
-  panel.webview.html = getDashboardHtml(tokenTracker.getStats());
-
-  panel.webview.onDidReceiveMessage(msg => {
-    if (msg.command === 'upgrade') {
-      vscode.env.openExternal(vscode.Uri.parse(`${APP_BASE}/pricing`));
-    }
-    if (msg.command === 'compareModels') {
-      showModelComparisonPanel(context);
-    }
-    if (msg.command === 'setBudget') {
-      vscode.commands.executeCommand('aiTokenTracker.setBudget');
-    }
-    if (msg.command === 'signOut') {
-      vscode.commands.executeCommand('aiTokenTracker.signOut');
-      panel.dispose();
-    }
-  });
-
-  const handler = (newStats: AllStats) => {
-    panel.webview.html = getDashboardHtml(newStats);
-  };
-  tokenTracker.on('update', handler);
-  panel.onDidDispose(() => tokenTracker.off('update', handler));
-}
-
-async function showModelComparisonPanel(context: vscode.ExtensionContext) {
-  const stats = tokenTracker.getStats();
-  const s = stats.currentSession;
-  if (!s) {
-    vscode.window.showInformationMessage('No active session to compare.');
+  if (dashboardPanel) {
+    dashboardPanel.reveal();
     return;
   }
 
-  const token = await authManager.getToken();
-  if (!token) return;
-
-  const panel = vscode.window.createWebviewPanel(
-    'modelComparison',
-    'Model Cost Comparison',
+  dashboardPanel = vscode.window.createWebviewPanel(
+    'aiTokenTrackerDashboard',
+    'AI Token Tracker',
     vscode.ViewColumn.Beside,
-    { enableScripts: true }
+    { enableScripts: true, retainContextWhenHidden: true }
   );
 
-  panel.webview.html = getLoadingHtml('Loading model comparison...');
+  dashboardPanel.webview.html = getDashboardHtml(tokenTracker.getStats());
 
-  try {
-    const res = await fetch(`${API_BASE}/usage/model-comparison/${s.sessionId}`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-    if (!res.ok) throw new Error('Failed to load comparison');
-    const data = await res.json() as {
-      actualModel: string; actualCost: number;
-      inputTokens: number; outputTokens: number;
-      comparisons: Array<{ model: string; totalCost: number; savingPct: number }>;
-    };
-    panel.webview.html = getModelComparisonHtml(data);
-  } catch {
-    panel.webview.html = getLoadingHtml('Failed to load comparison. Please try again.');
-  }
+  dashboardPanel.webview.onDidReceiveMessage(async msg => {
+    switch (msg.command) {
+      case 'setModel': {
+        const models = ['claude-opus-4', 'claude-sonnet-4', 'claude-haiku-3-5', 'gpt-4o', 'gpt-4o-mini'];
+        const picked = await vscode.window.showQuickPick(models, { placeHolder: 'Select default AI model' });
+        if (picked) {
+          await vscode.workspace.getConfiguration('aiTokenTracker').update('model', picked, vscode.ConfigurationTarget.Global);
+          tokenTracker.setModel(picked);
+        }
+        break;
+      }
+      case 'exportCsv':
+        await exportCsvLocally(tokenTracker.getStats());
+        break;
+      case 'resetSession':
+        tokenTracker.resetCurrentSession();
+        break;
+      case 'signIn':
+        await doSignIn(context);
+        break;
+    }
+  });
+
+  dashboardPanel.onDidDispose(() => {
+    dashboardPanel = undefined;
+  });
 }
 
-function getLoadingHtml(msg: string): string {
-  return `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background);padding:20px;">${msg}</body></html>`;
+async function exportCsvLocally(stats: AllStats) {
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(path.join(require('os').homedir(), 'ai-token-usage.csv')),
+    filters: { 'CSV Files': ['csv'] },
+  });
+  if (!uri) return;
+
+  const header = 'Session ID,Project,Model,Date,Input Tokens,Output Tokens,Cache Read,Cache Write,Turns,Cost (USD)\n';
+  const rows = stats.sessions.map(s => {
+    const date = new Date(s.startTime).toISOString().slice(0, 10);
+    return [
+      s.sessionId, s.projectName, s.model, date,
+      s.totalInput, s.totalOutput, s.totalCacheRead, s.totalCacheWrite,
+      s.turns, s.estimatedCost.toFixed(6),
+    ].join(',');
+  }).join('\n');
+
+  const enc = new TextEncoder();
+  await vscode.workspace.fs.writeFile(uri, enc.encode(header + rows));
+  vscode.window.showInformationMessage(`Exported ${stats.sessions.length} sessions to ${uri.fsPath}`);
 }
 
-function getModelComparisonHtml(data: {
-  actualModel: string; actualCost: number;
-  inputTokens: number; outputTokens: number;
-  comparisons: Array<{ model: string; totalCost: number; savingPct: number }>;
-}): string {
-  const rows = data.comparisons.map(c => {
-    const isActual = c.model === data.actualModel;
-    const savingLabel = c.savingPct > 0
-      ? `<span style="color:#3fb950">save ${c.savingPct}%</span>`
-      : c.savingPct < 0
-        ? `<span style="color:#f85149">${Math.abs(c.savingPct)}% more</span>`
-        : '<span>same</span>';
-    return `<tr ${isActual ? 'style="font-weight:700"' : ''}>
-      <td>${c.model}${isActual ? ' <span style="opacity:0.6">(current)</span>' : ''}</td>
-      <td style="text-align:right">$${c.totalCost.toFixed(6)}</td>
-      <td style="text-align:right">${savingLabel}</td>
-    </tr>`;
-  }).join('');
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 20px; font-size: 13px; }
-    h2 { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
-    .meta { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 20px; }
-    table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--vscode-widget-border); font-size: 11px; color: var(--vscode-descriptionForeground); }
-    th:not(:first-child) { text-align: right; }
-    td { padding: 8px 10px; border-bottom: 1px solid var(--vscode-editorWidget-background); }
-    tr:hover td { background: var(--vscode-list-hoverBackground); }
-  </style>
-</head>
-<body>
-  <h2>Model Cost Comparison</h2>
-  <p class="meta">Based on: ${fmtTokens(data.inputTokens)} input + ${fmtTokens(data.outputTokens)} output tokens &nbsp;·&nbsp; Actual: ${data.actualModel}</p>
-  <table>
-    <thead><tr><th>Model</th><th>Cost</th><th>vs. Current</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table>
-</body>
-</html>`;
-}
+// ─── Dashboard HTML ───────────────────────────────────────────────────────────
 
 function getDashboardHtml(stats: AllStats): string {
-  const paid = isPaid();
-
-  // Group sessions by date
-  const byDate = new Map<string, { input: number; output: number; cost: number; turns: number; sessions: number }>();
-  for (const s of stats.sessions) {
-    const date = new Date(s.startTime).toLocaleDateString('en-CA');
-    const ex = byDate.get(date) ?? { input: 0, output: 0, cost: 0, turns: 0, sessions: 0 };
-    byDate.set(date, {
-      input: ex.input + s.totalInput,
-      output: ex.output + s.totalOutput,
-      cost: ex.cost + s.estimatedCost,
-      turns: ex.turns + s.turns,
-      sessions: ex.sessions + 1,
-    });
-  }
-
-  const dailyRows = Array.from(byDate.entries())
-    .sort(([a], [b]) => b.localeCompare(a))
-    .map(([date, d]) => {
-      const label = formatDateLabel(date);
-      const costCell = paid
-        ? `<td class="cost">$${d.cost.toFixed(4)}</td>`
-        : '';
-      return `<tr>
-        <td><strong>${label}</strong><span class="date-sub">${date}</span></td>
-        <td>${fmtTokens(d.input)}</td>
-        <td>${fmtTokens(d.output)}</td>
-        ${costCell}
-        <td>${d.turns}</td>
-        <td>${d.sessions}</td>
-      </tr>`;
-    }).join('');
-
-  const chartDays = Array.from(byDate.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .slice(-14);
-  const maxVal = Math.max(...chartDays.map(([, d]) => paid ? d.cost : d.input + d.output), 0.0001);
-  const bars = chartDays.map(([date, d]) => {
-    const val = paid ? d.cost : d.input + d.output;
-    const height = Math.max(2, Math.round((val / maxVal) * 80));
-    const dateObj = new Date(date + 'T12:00:00');
-    const dayLabel = dateObj.getDate().toString();
-    const titleVal = paid ? `$${d.cost.toFixed(4)}` : `${fmtTokens(d.input + d.output)} tokens`;
-    const fullLabel = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    return `<div class="bar-wrap" title="${fullLabel}: ${titleVal}">
-      <div class="bar" style="height:${height}px"></div>
-      <div class="bar-label">${dayLabel}</div>
-    </div>`;
-  }).join('');
-
-  const dailyCols = paid
-    ? `<th>Date</th><th>Input</th><th>Output</th><th>Cost</th><th>Turns</th><th>Sessions</th>`
-    : `<th>Date</th><th>Input</th><th>Output</th><th>Turns</th><th>Sessions</th>`;
-
-  const sessionCols = paid
-    ? `<th>Time</th><th>Model</th><th>Input</th><th>Output</th><th>Cost</th><th>Turns</th>`
-    : `<th>Time</th><th>Model</th><th>Input</th><th>Output</th><th>Turns</th>`;
-
-  const colSpanDaily   = paid ? 6 : 5;
-  const colSpanSession = paid ? 6 : 5;
-
-  const sessionRows = stats.sessions
-    .slice(0, 20)
-    .map(s => {
-      const time = new Date(s.startTime).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-      const costCell = paid ? `<td class="cost">$${s.estimatedCost.toFixed(4)}</td>` : '';
-      return `<tr>
-        <td class="dim">${time}</td>
-        <td>${s.model}</td>
-        <td>${fmtTokens(s.totalInput)}</td>
-        <td>${fmtTokens(s.totalOutput)}</td>
-        ${costCell}
-        <td>${s.turns}</td>
-      </tr>`;
-    }).join('');
-
-  const costCard = paid
-    ? `<div class="card"><label>Estimated Cost</label><value>$${stats.allTimeTotalCost.toFixed(4)}</value></div>`
-    : `<div class="card upgrade-card"><label>Estimated Cost</label><value class="locked">Upgrade</value><a href="#" onclick="upgrade()" class="upgrade-link">See costs →</a></div>`;
-
-  const chartLabel = paid ? 'Daily Cost (last 14 days)' : 'Daily Tokens (last 14 days)';
-
-  // Blurred lock overlay for free users
-  const lockedOverlay = !paid ? `
-    <div class="lock-overlay">
-      <div class="lock-box">
-        <div class="lock-icon">🔒</div>
-        <h3>Unlock your dashboard</h3>
-        <p>Cost breakdown, daily trends, and project attribution are Pro features.</p>
-        <button onclick="upgrade()" class="upgrade-btn">Upgrade to Pro — $9/mo</button>
-      </div>
-    </div>` : '';
-
-  const proActions = paid ? `
-    <div class="pro-actions">
-      <button onclick="compareModels()" class="action-btn">⚡ Compare Models</button>
-      <button onclick="setBudget()" class="action-btn">💰 Set Budget</button>
-    </div>` : '';
-
+  const initialData = JSON.stringify(stats);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 20px; font-size: 13px; }
-    h2 { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
-    h3 { font-size: 12px; font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
-    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
-    .card { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-widget-border); border-radius: 8px; padding: 12px 14px; position: relative; }
-    .card label { font-size: 11px; color: var(--vscode-descriptionForeground); display: block; margin-bottom: 6px; }
-    .card value { font-size: 22px; font-weight: 700; }
-    .card value.locked { font-size: 14px; color: var(--vscode-descriptionForeground); }
-    .upgrade-card { border-color: var(--vscode-focusBorder); }
-    .upgrade-link { font-size: 11px; color: var(--vscode-textLink-foreground); display: block; margin-top: 4px; cursor: pointer; text-decoration: none; }
-    .pro-actions { display: flex; gap: 8px; margin-bottom: 20px; }
-    .action-btn { background: var(--vscode-editorWidget-background); color: var(--vscode-foreground); border: 1px solid var(--vscode-widget-border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
-    .action-btn:hover { background: var(--vscode-list-hoverBackground); }
-    .section { margin-bottom: 24px; position: relative; }
-    .chart { display: flex; align-items: flex-end; gap: 4px; height: 100px; padding: 8px 0 4px; border-bottom: 1px solid var(--vscode-widget-border); margin-bottom: 4px; }
-    .bar-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1; cursor: default; }
-    .bar { width: 100%; background: var(--vscode-button-background); border-radius: 3px 3px 0 0; opacity: 0.85; min-width: 6px; }
-    .bar:hover { opacity: 1; }
-    .bar-label { font-size: 9px; color: var(--vscode-descriptionForeground); }
-    .chart-empty { height: 100px; display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); font-size: 12px; }
-    .tabs { display: flex; gap: 2px; margin-bottom: 12px; }
-    .tab { padding: 5px 14px; font-size: 12px; border-radius: 5px; cursor: pointer; border: 1px solid transparent; color: var(--vscode-descriptionForeground); background: transparent; }
-    .tab.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-    .tab-content { display: none; }
-    .tab-content.active { display: block; }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--vscode-widget-border); color: var(--vscode-descriptionForeground); font-weight: 600; font-size: 11px; white-space: nowrap; }
-    td { padding: 7px 8px; border-bottom: 1px solid var(--vscode-editorWidget-background); vertical-align: top; }
-    tr:hover td { background: var(--vscode-list-hoverBackground); }
-    .cost { font-variant-numeric: tabular-nums; }
-    .dim { color: var(--vscode-descriptionForeground); }
-    .date-sub { display: block; font-size: 10px; color: var(--vscode-descriptionForeground); font-weight: 400; }
-    .empty { text-align: center; padding: 32px; color: var(--vscode-descriptionForeground); }
-    /* Locked overlay */
-    .lock-overlay { position: absolute; inset: 0; backdrop-filter: blur(6px); background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; border-radius: 8px; z-index: 10; }
-    .lock-box { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-focusBorder); border-radius: 12px; padding: 24px 28px; text-align: center; max-width: 280px; }
-    .lock-icon { font-size: 28px; margin-bottom: 10px; }
-    .lock-box h3 { font-size: 14px; font-weight: 700; margin-bottom: 8px; color: var(--vscode-foreground); text-transform: none; letter-spacing: 0; }
-    .lock-box p { font-size: 12px; color: var(--vscode-descriptionForeground); margin-bottom: 16px; line-height: 1.5; }
-    .upgrade-btn { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600; width: 100%; }
-    .upgrade-btn:hover { opacity: 0.9; }
-    .blurred { filter: blur(4px); pointer-events: none; user-select: none; }
-    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-    .signout-btn { font-size: 11px; color: var(--vscode-descriptionForeground); background: transparent; border: 1px solid var(--vscode-widget-border); border-radius: 4px; padding: 3px 8px; cursor: pointer; }
-    .signout-btn:hover { color: var(--vscode-foreground); }
-  </style>
+<meta charset="UTF-8">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --accent:#4fc3f7;
+  --accent-dim:rgba(79,195,247,.15);
+  --green:#66bb6a;
+  --amber:#ffa726;
+  --red:#ef5350;
+  --card-bg:var(--vscode-editorWidget-background);
+  --border:var(--vscode-widget-border);
+  --fg:var(--vscode-foreground);
+  --fg-dim:var(--vscode-descriptionForeground);
+  --bg:var(--vscode-editor-background);
+  --hover:var(--vscode-list-hoverBackground);
+  --btn-bg:var(--vscode-button-background);
+  --btn-fg:var(--vscode-button-foreground);
+}
+body{font-family:var(--vscode-font-family);color:var(--fg);background:var(--bg);font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+/* ── Header ── */
+.header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+.logo{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700}
+.logo-icon{font-size:18px;animation:spin 8s linear infinite}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.header-btns{display:flex;gap:5px}
+.btn{background:transparent;color:var(--fg-dim);border:1px solid var(--border);border-radius:5px;padding:4px 9px;cursor:pointer;font-size:11px;font-family:inherit;transition:all .15s}
+.btn:hover{color:var(--fg);border-color:var(--accent);background:var(--accent-dim)}
+
+/* ── Live session bar ── */
+.live-bar{display:flex;align-items:center;gap:16px;padding:10px 14px;background:var(--accent-dim);border-bottom:1px solid var(--border);flex-shrink:0;min-height:52px}
+.live-bar.idle{background:transparent}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex-shrink:0;animation:pulse-dot 1.2s ease-in-out infinite}
+.live-bar.idle .live-dot{background:var(--fg-dim);animation:none}
+@keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
+.live-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);flex-shrink:0}
+.live-bar.idle .live-label{color:var(--fg-dim)}
+.live-model{font-size:11px;color:var(--fg-dim);font-family:var(--vscode-editor-font-family,monospace);flex-shrink:0}
+.live-metrics{display:flex;gap:14px;flex:1;flex-wrap:wrap}
+.live-metric{display:flex;flex-direction:column;align-items:center;gap:1px}
+.live-metric .lm-val{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;transition:color .3s}
+.live-metric .lm-val.flash{color:var(--accent)}
+.live-metric .lm-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-dim)}
+.live-cost .lm-val{color:var(--amber)}
+.live-sep{width:1px;height:32px;background:var(--border);flex-shrink:0}
+
+/* ── Summary cards ── */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:7px;padding:10px 14px;flex-shrink:0}
+.card{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:9px 12px;position:relative;overflow:hidden;transition:border-color .2s}
+.card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,transparent 60%,rgba(255,255,255,.02));pointer-events:none}
+.card:hover{border-color:var(--accent)}
+.card label{font-size:10px;color:var(--fg-dim);display:block;margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em}
+.card .cv{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;transition:all .3s}
+.card .cv.flash{transform:scale(1.06);color:var(--accent)}
+.card .csub{font-size:10px;color:var(--fg-dim);margin-top:2px}
+.card-accent{border-color:color-mix(in srgb,var(--accent) 40%,var(--border))}
+.card-green{border-color:color-mix(in srgb,var(--green) 40%,var(--border))}
+
+/* ── Nav tabs ── */
+.nav{display:flex;gap:0;padding:0 14px;flex-shrink:0;border-bottom:1px solid var(--border)}
+.nav-tab{padding:7px 13px;font-size:12px;cursor:pointer;border:none;background:transparent;color:var(--fg-dim);font-family:inherit;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .15s}
+.nav-tab.active{color:var(--fg);border-bottom-color:var(--accent)}
+.nav-tab:hover{color:var(--fg);background:var(--hover)}
+
+/* ── Content ── */
+.content{flex:1;overflow:hidden;position:relative}
+.tab-page{display:none;height:100%;overflow-y:auto;padding:12px 14px}
+.tab-page.active{display:block}
+
+/* ── Chart ── */
+.chart-wrap{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:12px}
+.chart-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.chart-title{font-size:10px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.05em}
+.chart-total{font-size:11px;font-weight:600;color:var(--amber)}
+.chart{display:flex;align-items:flex-end;gap:3px;height:72px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+.bar-wrap{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;cursor:default;min-width:0}
+.bar{width:100%;background:var(--btn-bg);border-radius:3px 3px 0 0;opacity:.75;min-width:4px;min-height:3px;transition:height .4s cubic-bezier(.34,1.56,.64,1),opacity .15s}
+.bar:hover{opacity:1;background:var(--accent)}
+.bar-label{font-size:8px;color:var(--fg-dim);overflow:hidden;text-overflow:clip}
+.bar.today{background:var(--accent);opacity:.9}
+.chart-empty{height:72px;display:flex;align-items:center;justify-content:center;color:var(--fg-dim);font-size:12px}
+
+/* ── Tables ── */
+.section-hdr{font-size:10px;font-weight:600;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px;margin-top:4px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--border);color:var(--fg-dim);font-weight:600;font-size:10px;white-space:nowrap;position:sticky;top:0;background:var(--bg);text-transform:uppercase;letter-spacing:.04em}
+td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;white-space:nowrap}
+tr:hover td{background:var(--hover)}
+tr.new-row td{animation:row-in .3s ease}
+@keyframes row-in{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:translateX(0)}}
+.cost{font-variant-numeric:tabular-nums;color:var(--amber)}
+.mono{font-family:var(--vscode-editor-font-family,monospace);font-size:11px}
+.dim{color:var(--fg-dim)}
+.blk{display:block}
+.empty{text-align:center;padding:24px;color:var(--fg-dim);font-style:italic;font-size:12px}
+
+/* ── Percent bars ── */
+.pct-row{display:flex;align-items:center;gap:6px;min-width:90px}
+.pct-track{flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden}
+.pct-fill{height:100%;background:var(--btn-bg);border-radius:3px;transition:width .5s ease}
+.pct-fill.top{background:var(--accent)}
+.pct-lbl{font-size:10px;color:var(--fg-dim);width:34px;text-align:right}
+
+/* ── Model compare ── */
+.cur-model td{font-weight:700;color:var(--fg)}
+.green-txt{color:var(--green)}
+.red-txt{color:var(--red)}
+.compare-box{margin-top:14px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.compare-box h4{font-size:10px;font-weight:600;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.compare-meta{font-size:11px;color:var(--fg-dim);margin-bottom:8px}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
 </head>
 <body>
-  <div class="header">
-    <h2>◈ AI Token Tracker</h2>
-    <button class="signout-btn" onclick="signOut()">Sign out</button>
+
+<div class="header">
+  <div class="logo"><span class="logo-icon">◈</span> AI Token Tracker</div>
+  <div class="header-btns">
+    <button class="btn" onclick="vscode.postMessage({command:'setModel'})">⚙ Model</button>
+    <button class="btn" onclick="vscode.postMessage({command:'exportCsv'})">↓ CSV</button>
+    <button class="btn" onclick="vscode.postMessage({command:'resetSession'})">↺ Reset</button>
   </div>
+</div>
 
-  ${proActions}
-
-  <div class="cards">
-    <div class="card"><label>Total Input</label><value>${fmtTokens(stats.allTimeTotalInput)}</value></div>
-    <div class="card"><label>Total Output</label><value>${fmtTokens(stats.allTimeTotalOutput)}</value></div>
-    ${costCard}
+<div id="live-bar" class="live-bar idle">
+  <div class="live-dot"></div>
+  <span class="live-label" id="live-label">Idle</span>
+  <div class="live-sep"></div>
+  <span class="live-model" id="live-model">—</span>
+  <div class="live-sep"></div>
+  <div class="live-metrics">
+    <div class="live-metric"><span class="lm-val" id="ls-input">—</span><span class="lm-lbl">Input</span></div>
+    <div class="live-metric"><span class="lm-val" id="ls-output">—</span><span class="lm-lbl">Output</span></div>
+    <div class="live-metric"><span class="lm-val" id="ls-cache">—</span><span class="lm-lbl">Cache</span></div>
+    <div class="live-metric"><span class="lm-val" id="ls-turns">—</span><span class="lm-lbl">Turns</span></div>
+    <div class="live-metric live-cost"><span class="lm-val" id="ls-cost">—</span><span class="lm-lbl">Cost</span></div>
   </div>
+</div>
 
-  <div class="section" style="position:relative">
-    <h3 ${!paid ? 'class="blurred"' : ''}>${chartLabel}</h3>
-    ${bars ? `<div class="chart ${!paid ? 'blurred' : ''}">${bars}</div>` : '<div class="chart-empty">No data yet</div>'}
-    ${lockedOverlay}
+<div class="cards">
+  <div class="card card-accent">
+    <label>Today</label>
+    <div class="cv" id="c-today-cost">$0.0000</div>
+    <div class="csub" id="c-today-tok">0 tokens</div>
   </div>
-
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('daily', this)">By Day</button>
-    <button class="tab" onclick="switchTab('sessions', this)">Sessions</button>
+  <div class="card">
+    <label>This Month</label>
+    <div class="cv" id="c-month">$0.0000</div>
+    <div class="csub" id="c-month-lbl"></div>
   </div>
+  <div class="card">
+    <label>All-Time Cost</label>
+    <div class="cv" id="c-total-cost">$0.0000</div>
+    <div class="csub" id="c-sessions">0 sessions</div>
+  </div>
+  <div class="card">
+    <label>Total Tokens</label>
+    <div class="cv" id="c-tokens">0</div>
+    <div class="csub" id="c-tok-breakdown"></div>
+  </div>
+  <div class="card card-green">
+    <label>Cache Reads</label>
+    <div class="cv" id="c-cache">0</div>
+    <div class="csub" id="c-cache-write"></div>
+  </div>
+</div>
 
-  <div id="daily" class="tab-content active" style="position:relative">
-    <table class="${!paid ? 'blurred' : ''}">
-      <thead><tr>${dailyCols}</tr></thead>
-      <tbody>${dailyRows || `<tr><td colspan="${colSpanDaily}" class="empty">No data yet — start using Claude Code.</td></tr>`}</tbody>
+<div class="nav">
+  <button class="nav-tab active" onclick="showPage('overview',this)">Overview</button>
+  <button class="nav-tab" onclick="showPage('sessions',this)">Sessions</button>
+  <button class="nav-tab" onclick="showPage('models',this)">Models</button>
+  <button class="nav-tab" onclick="showPage('projects',this)">Projects</button>
+</div>
+
+<div class="content">
+  <div id="overview" class="tab-page active">
+    <div class="chart-wrap">
+      <div class="chart-hdr">
+        <span class="chart-title">Daily Cost — last 30 days</span>
+        <span class="chart-total" id="chart-total"></span>
+      </div>
+      <div id="chart" class="chart"><div class="chart-empty">No data yet</div></div>
+    </div>
+    <div class="section-hdr">Recent Sessions</div>
+    <table>
+      <thead><tr><th>Time</th><th>Model</th><th>Project</th><th>Input</th><th>Output</th><th>Cost</th><th>Turns</th></tr></thead>
+      <tbody id="recent-body"><tr><td colspan="7" class="empty">No sessions yet — start using Claude Code.</td></tr></tbody>
     </table>
-    ${!paid ? lockedOverlay : ''}
   </div>
 
-  <div id="sessions" class="tab-content" style="position:relative">
-    <table class="${!paid ? 'blurred' : ''}">
-      <thead><tr>${sessionCols}</tr></thead>
-      <tbody>${sessionRows || `<tr><td colspan="${colSpanSession}" class="empty">No sessions yet.</td></tr>`}</tbody>
+  <div id="sessions" class="tab-page">
+    <table>
+      <thead><tr><th>Time</th><th>Model</th><th>Project</th><th>Input</th><th>Output</th><th>Cache</th><th>Cost</th><th>Turns</th></tr></thead>
+      <tbody id="sessions-body"><tr><td colspan="8" class="empty">No sessions yet.</td></tr></tbody>
     </table>
-    ${!paid ? lockedOverlay : ''}
   </div>
 
-  <script>
-    const vscode = acquireVsCodeApi();
-    function switchTab(name, btn) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-      document.getElementById(name).classList.add('active');
-      btn.classList.add('active');
-    }
-    function upgrade() { vscode.postMessage({ command: 'upgrade' }); }
-    function compareModels() { vscode.postMessage({ command: 'compareModels' }); }
-    function setBudget() { vscode.postMessage({ command: 'setBudget' }); }
-    function signOut() { vscode.postMessage({ command: 'signOut' }); }
-  </script>
+  <div id="models" class="tab-page">
+    <table>
+      <thead><tr><th>Model</th><th>Sessions</th><th>Input</th><th>Output</th><th>Cost</th><th>Share</th></tr></thead>
+      <tbody id="models-body"><tr><td colspan="6" class="empty">No model data yet.</td></tr></tbody>
+    </table>
+    <div class="compare-box" id="compare-box" style="display:none">
+      <h4>Model Comparison — Current Session</h4>
+      <div class="compare-meta" id="compare-meta"></div>
+      <table>
+        <thead><tr><th>Model</th><th>Est. Cost</th><th>vs. Current</th></tr></thead>
+        <tbody id="compare-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="projects" class="tab-page">
+    <table>
+      <thead><tr><th>Project</th><th>Sessions</th><th>Tokens</th><th>Cost</th><th>Share</th></tr></thead>
+      <tbody id="projects-body"><tr><td colspan="5" class="empty">No project data yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const vscode = acquireVsCodeApi();
+const PRICING = {
+  'claude-opus-4':     {input:15,output:75,cacheRead:1.5,cacheWrite:18.75},
+  'claude-opus-4-5':   {input:15,output:75,cacheRead:1.5,cacheWrite:18.75},
+  'claude-sonnet-4':   {input:3,output:15,cacheRead:.3,cacheWrite:3.75},
+  'claude-sonnet-4-5': {input:3,output:15,cacheRead:.3,cacheWrite:3.75},
+  'claude-haiku-3-5':  {input:.8,output:4,cacheRead:.08,cacheWrite:1},
+  'gpt-4o':            {input:2.5,output:10,cacheRead:1.25,cacheWrite:0},
+  'gpt-4o-mini':       {input:.15,output:.6,cacheRead:.075,cacheWrite:0},
+};
+const ALL_MODELS = Object.keys(PRICING);
+const DEFAULT_P = {input:3,output:15,cacheRead:.3,cacheWrite:3.75};
+
+function calcCost(model,t){
+  const p=PRICING[model]||DEFAULT_P,M=1e6;
+  return t.input/M*p.input+t.output/M*p.output+t.cacheRead/M*p.cacheRead+t.cacheWrite/M*p.cacheWrite;
+}
+
+function fmt(n){
+  if(n>=1e6)return(n/1e6).toFixed(1)+'M';
+  if(n>=1e3)return(n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+
+function flash(el){
+  el.classList.remove('flash');
+  void el.offsetWidth;
+  el.classList.add('flash');
+  setTimeout(()=>el.classList.remove('flash'),600);
+}
+
+function set(id,val,doFlash=false){
+  const el=document.getElementById(id);
+  if(!el)return;
+  if(el.textContent!==val){
+    el.textContent=val;
+    if(doFlash)flash(el);
+  }
+}
+
+function render(data){
+  const sessions=data.sessions||[];
+  const cur=data.currentSession;
+  const todayStr=new Date().toLocaleDateString('en-CA');
+  const monthPrefix=todayStr.slice(0,7);
+
+  // ── Live bar ──
+  const lb=document.getElementById('live-bar');
+  if(cur){
+    lb.classList.remove('idle');
+    document.getElementById('live-label').textContent='● Live';
+    document.getElementById('live-model').textContent=cur.model;
+    set('ls-input', fmt(cur.totalInput),true);
+    set('ls-output',fmt(cur.totalOutput),true);
+    set('ls-cache', fmt(cur.totalCacheRead),true);
+    set('ls-turns', String(cur.turns),true);
+    set('ls-cost',  '$'+cur.estimatedCost.toFixed(4),true);
+  } else {
+    lb.classList.add('idle');
+    document.getElementById('live-label').textContent='Idle';
+    document.getElementById('live-model').textContent='No active session';
+    ['ls-input','ls-output','ls-cache','ls-turns','ls-cost'].forEach(id=>set(id,'—'));
+  }
+
+  // ── Aggregate by date ──
+  const byDate=new Map();
+  const byModel=new Map();
+  const byProject=new Map();
+  let totalCacheRead=0,totalCacheWrite=0;
+  for(const s of sessions){
+    const d=new Date(s.startTime).toLocaleDateString('en-CA');
+    const ex=byDate.get(d)||{input:0,output:0,cost:0,turns:0,sessions:0};
+    byDate.set(d,{input:ex.input+s.totalInput,output:ex.output+s.totalOutput,cost:ex.cost+s.estimatedCost,turns:ex.turns+s.turns,sessions:ex.sessions+1});
+    const em=byModel.get(s.model)||{cost:0,input:0,output:0,sessions:0,turns:0};
+    byModel.set(s.model,{cost:em.cost+s.estimatedCost,input:em.input+s.totalInput,output:em.output+s.totalOutput,sessions:em.sessions+1,turns:em.turns+s.turns});
+    const ep=byProject.get(s.projectName)||{cost:0,input:0,output:0,sessions:0,turns:0};
+    byProject.set(s.projectName,{cost:ep.cost+s.estimatedCost,input:ep.input+s.totalInput,output:ep.output+s.totalOutput,sessions:ep.sessions+1,turns:ep.turns+s.turns});
+    totalCacheRead+=s.totalCacheRead; totalCacheWrite+=s.totalCacheWrite;
+  }
+
+  const todayD=byDate.get(todayStr)||{cost:0,input:0,output:0};
+  let monthCost=0;
+  for(const[d,v]of byDate)if(d.startsWith(monthPrefix))monthCost+=v.cost;
+  const totalCost=data.allTimeTotalCost||0;
+
+  // ── Cards ──
+  set('c-today-cost','$'+todayD.cost.toFixed(4),true);
+  set('c-today-tok',fmt(todayD.input+todayD.output)+' tokens');
+  set('c-month','$'+monthCost.toFixed(4),true);
+  set('c-month-lbl',new Date().toLocaleDateString('en-US',{month:'long'}));
+  set('c-total-cost','$'+totalCost.toFixed(4),true);
+  set('c-sessions',sessions.length+' sessions');
+  set('c-tokens',fmt(data.allTimeTotalInput+data.allTimeTotalOutput),true);
+  set('c-tok-breakdown',fmt(data.allTimeTotalInput)+' in · '+fmt(data.allTimeTotalOutput)+' out');
+  set('c-cache',fmt(totalCacheRead),true);
+  set('c-cache-write',fmt(totalCacheWrite)+' written');
+
+  // ── Chart ──
+  set('chart-total','$'+totalCost.toFixed(2)+' total');
+  const sortedDays=Array.from(byDate.entries()).sort(([a],[b])=>a<b?-1:1).slice(-30);
+  const maxCost=Math.max(...sortedDays.map(([,d])=>d.cost),0.0001);
+  const chartEl=document.getElementById('chart');
+  if(sortedDays.length===0){
+    chartEl.innerHTML='<div class="chart-empty">No data yet</div>';
+  } else {
+    chartEl.innerHTML=sortedDays.map(([date,d])=>{
+      const h=Math.max(3,Math.round(d.cost/maxCost*68));
+      const day=new Date(date+'T12:00:00').getDate();
+      const isToday=date===todayStr;
+      const label=new Date(date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'});
+      return \`<div class="bar-wrap" title="\${label}: $\${d.cost.toFixed(4)}">
+        <div class="bar\${isToday?' today':''}" style="height:\${h}px"></div>
+        <div class="bar-label">\${day}</div>
+      </div>\`;
+    }).join('');
+  }
+
+  // ── Recent sessions ──
+  const recentEl=document.getElementById('recent-body');
+  if(sessions.length===0){
+    recentEl.innerHTML='<tr><td colspan="7" class="empty">No sessions yet — start using Claude Code.</td></tr>';
+  } else {
+    recentEl.innerHTML=sessions.slice(0,10).map(s=>{
+      const t=new Date(s.startTime).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      return \`<tr>
+        <td class="dim">\${t}</td>
+        <td class="mono">\${s.model}</td>
+        <td>\${s.projectName}</td>
+        <td>\${fmt(s.totalInput)}</td>
+        <td>\${fmt(s.totalOutput)}</td>
+        <td class="cost">$\${s.estimatedCost.toFixed(4)}</td>
+        <td>\${s.turns}</td>
+      </tr>\`;
+    }).join('');
+  }
+
+  // ── All sessions ──
+  const sessEl=document.getElementById('sessions-body');
+  if(sessions.length===0){
+    sessEl.innerHTML='<tr><td colspan="8" class="empty">No sessions yet.</td></tr>';
+  } else {
+    sessEl.innerHTML=sessions.map(s=>{
+      const t=new Date(s.startTime).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      return \`<tr>
+        <td class="dim">\${t}</td>
+        <td class="mono">\${s.model}</td>
+        <td>\${s.projectName}</td>
+        <td>\${fmt(s.totalInput)}</td>
+        <td>\${fmt(s.totalOutput)}</td>
+        <td>\${fmt(s.totalCacheRead)}</td>
+        <td class="cost">$\${s.estimatedCost.toFixed(4)}</td>
+        <td>\${s.turns}</td>
+      </tr>\`;
+    }).join('');
+  }
+
+  // ── Models ──
+  const modArr=Array.from(byModel.entries()).sort(([,a],[,b])=>b.cost-a.cost);
+  const modEl=document.getElementById('models-body');
+  if(modArr.length===0){
+    modEl.innerHTML='<tr><td colspan="6" class="empty">No model data yet.</td></tr>';
+  } else {
+    modEl.innerHTML=modArr.map(([model,d],i)=>{
+      const pct=totalCost>0?(d.cost/totalCost*100):0;
+      return \`<tr>
+        <td class="mono">\${model}</td>
+        <td>\${d.sessions}</td>
+        <td>\${fmt(d.input)}</td>
+        <td>\${fmt(d.output)}</td>
+        <td class="cost">$\${d.cost.toFixed(4)}</td>
+        <td><div class="pct-row"><div class="pct-track"><div class="pct-fill\${i===0?' top':''}" style="width:\${pct.toFixed(1)}%"></div></div><span class="pct-lbl">\${pct.toFixed(1)}%</span></div></td>
+      </tr>\`;
+    }).join('');
+  }
+
+  // ── Model comparison ──
+  const compareBox=document.getElementById('compare-box');
+  if(cur&&cur.totalInput>0){
+    compareBox.style.display='block';
+    set('compare-meta',\`Based on \${fmt(cur.totalInput)} input + \${fmt(cur.totalOutput)} output · Current: \${cur.model}\`);
+    document.getElementById('compare-body').innerHTML=ALL_MODELS.map(m=>{
+      const cost=calcCost(m,{input:cur.totalInput,output:cur.totalOutput,cacheRead:cur.totalCacheRead,cacheWrite:cur.totalCacheWrite});
+      const isCur=m===cur.model;
+      const diff=cur.estimatedCost>0?((cur.estimatedCost-cost)/cur.estimatedCost*100):0;
+      const diffHtml=isCur?'<span class="dim">current</span>'
+        :diff>0.1?\`<span class="green-txt">save \${diff.toFixed(1)}%</span>\`
+        :diff<-0.1?\`<span class="red-txt">\${Math.abs(diff).toFixed(1)}% more</span>\`
+        :'<span class="dim">~same</span>';
+      return \`<tr\${isCur?' class="cur-model"':''}>
+        <td class="mono">\${m}\${isCur?' <span class="dim">(current)</span>':''}</td>
+        <td class="cost">$\${cost.toFixed(6)}</td>
+        <td>\${diffHtml}</td>
+      </tr>\`;
+    }).join('');
+  } else {
+    compareBox.style.display='none';
+  }
+
+  // ── Projects ──
+  const projArr=Array.from(byProject.entries()).sort(([,a],[,b])=>b.cost-a.cost);
+  const projEl=document.getElementById('projects-body');
+  if(projArr.length===0){
+    projEl.innerHTML='<tr><td colspan="5" class="empty">No project data yet.</td></tr>';
+  } else {
+    projEl.innerHTML=projArr.map(([proj,d],i)=>{
+      const pct=totalCost>0?(d.cost/totalCost*100):0;
+      return \`<tr>
+        <td>\${proj}</td>
+        <td>\${d.sessions}</td>
+        <td>\${fmt(d.input+d.output)}</td>
+        <td class="cost">$\${d.cost.toFixed(4)}</td>
+        <td><div class="pct-row"><div class="pct-track"><div class="pct-fill\${i===0?' top':''}" style="width:\${pct.toFixed(1)}%"></div></div><span class="pct-lbl">\${pct.toFixed(1)}%</span></div></td>
+      </tr>\`;
+    }).join('');
+  }
+}
+
+function showPage(name,btn){
+  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-page').forEach(t=>t.classList.remove('active'));
+  document.getElementById(name).classList.add('active');
+  btn.classList.add('active');
+}
+
+window.addEventListener('message',e=>{
+  if(e.data.type==='update')render(e.data.data);
+});
+
+// Initial render
+render(${initialData});
+</script>
 </body>
 </html>`;
 }
 
 function formatDateLabel(dateStr: string): string {
-  const today = new Date().toLocaleDateString('en-CA');
+  const today     = new Date().toLocaleDateString('en-CA');
   const yesterday = new Date(Date.now() - 86_400_000).toLocaleDateString('en-CA');
-  if (dateStr === today) return 'Today';
+  if (dateStr === today)     return 'Today';
   if (dateStr === yesterday) return 'Yesterday';
   return new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`;
   return n.toString();
 }

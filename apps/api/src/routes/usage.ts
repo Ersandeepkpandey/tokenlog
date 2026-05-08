@@ -2,7 +2,7 @@ import { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../lib/prisma';
 import { authenticate, requirePlan } from '../middleware/authenticate';
 import { Plan } from '@prisma/client';
-import { calcCost, PRICING, DEFAULT_TIER } from '../lib/pricing';
+import { calcCost, PRICING } from '../lib/pricing';
 import { recalcDailyStats } from '../services/statsService';
 import { getInsight } from '../services/insightService';
 import { getWeeklySummary } from '../services/weeklyDigest';
@@ -341,9 +341,8 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
 
 };
 
-function getHistoryDays(plan: Plan): number {
-  const limits: Record<Plan, number> = { FREE: 30, PRO: 365, TEAM: 365, ENTERPRISE: 9999 };
-  return limits[plan];
+function getHistoryDays(_plan: Plan): number {
+  return 9999; // All plans get full history
 }
 
 async function checkBudgetAlerts(userId: string) {

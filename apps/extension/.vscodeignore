@@ -1,8 +1,6 @@
-.vscode/**
 src/**
 node_modules/**
-*.ts
+.vscode/**
 tsconfig.json
 esbuild.js
-.env
-*.map
+*.vsix

@@ -22,4 +22,4 @@ We pledge to make participation in our project a harassment-free experience for 
 
 Project maintainers may remove, edit, or reject comments, commits, code, and other contributions that violate this Code of Conduct.
 
-Report issues to: sandeeppandeycga@outlook.com
+Report issues to: Ersandeepkpandey@gmail.com
